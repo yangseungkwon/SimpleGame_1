@@ -1,0 +1,549 @@
+import React, { useEffect, useRef, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+
+// =============================
+// Galaga-like Canvas Shooter
+// Single-file React component
+// Controls: ← → to move, Space to fire, P to pause, R to restart
+// Touch controls included for mobile (left / right / fire buttons)
+// =============================
+
+// Utility helpers
+const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+const rand = (min, max) => Math.random() * (max - min) + min;
+
+// Game constants
+const GAME_W = 800;
+const GAME_H = 1000;
+const SCALE_MIN = 0.6; // responsive scale down
+const PLAYER_SPEED = 420; // px/s
+const BULLET_SPEED = 700; // px/s
+const ENEMY_BULLET_SPEED = 340; // px/s
+const FIRE_COOLDOWN = 180; // ms
+const MAX_LIVES = 3;
+const WAVE_BASE_ENEMIES = 24;
+
+// Types
+/** @typedef {{x:number,y:number,w:number,h:number}} Rect */
+/** @typedef {{x:number,y:number, vx:number, vy:number, alive:boolean, kind:number, inDive:boolean, cool:number}} Enemy */
+/** @typedef {{x:number,y:number, vy:number, fromEnemy?:boolean}} Bullet */
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function useKeyHold() {
+  const hold = useRef({});
+  useEffect(() => {
+    const down = (e) => {
+      // Prevent browser scroll / focus side-effects on hold
+      if (["ArrowLeft", "ArrowRight", "Space"].includes(e.code)) e.preventDefault();
+      hold.current[e.code] = true; // stay true while key is held
+    };
+    const up = (e) => {
+      if (["ArrowLeft", "ArrowRight", "Space"].includes(e.code)) e.preventDefault();
+      hold.current[e.code] = false;
+    };
+    const clearOnBlur = () => {
+      // Clear all keys if window loses focus to avoid stuck states
+      hold.current = {};
+    };
+
+    window.addEventListener("keydown", down, { passive: false });
+    window.addEventListener("keyup", up, { passive: false });
+    window.addEventListener("blur", clearOnBlur);
+
+    return () => {
+      window.removeEventListener("keydown", down, { passive: false });
+      window.removeEventListener("keyup", up, { passive: false });
+      window.removeEventListener("blur", clearOnBlur);
+    };
+  }, []);
+  return hold;
+}
+
+export default function GalagaCanvas() {
+  const canvasRef = useRef(null);
+  const wrapRef = useRef(null);
+  const keys = useKeyHold();
+
+  const [running, setRunning] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [score, setScore] = useState(0);
+  const [lives, setLives] = useState(MAX_LIVES);
+  const [wave, setWave] = useState(1);
+  const [scale, setScale] = useState(1);
+  const [hint, setHint] = useState("← → 이동, Space 발사");
+  const [showTouch, setShowTouch] = useState(false);
+
+  // virtual game state kept in refs so RAF loop can mutate without re-renders
+  const playerRef = useRef({ x: GAME_W / 2 - 20, y: GAME_H - 120, w: 40, h: 30, cooldown: 0 });
+  const bulletsRef = useRef(/** @type {Bullet[]} */([]));
+  const enemiesRef = useRef(/** @type {Enemy[]} */([]));
+  const lastTimeRef = useRef(0);
+  const gameOverRef = useRef(false);
+
+  // Responsive scale to fit container
+  useEffect(() => {
+    const resize = () => {
+      const el = wrapRef.current;
+      if (!el) return;
+      const { clientWidth, clientHeight } = el;
+      const sx = clientWidth / GAME_W;
+      const sy = clientHeight / GAME_H;
+      const s = clamp(Math.min(sx, sy), SCALE_MIN, 1);
+      setScale(s);
+    };
+    resize();
+    const ro = new ResizeObserver(resize);
+    if (wrapRef.current) ro.observe(wrapRef.current);
+    return () => ro.disconnect();
+  }, []);
+
+  // Touch controls visibility
+  useEffect(() => {
+    setShowTouch("ontouchstart" in window || navigator.maxTouchPoints > 0);
+  }, []);
+
+  // Initialize first wave
+  const buildWave = (n) => {
+    const cols = 8;
+    const rows = Math.ceil(n / cols);
+    const gapX = 80;
+    const gapY = 70;
+    const startX = (GAME_W - (cols - 1) * gapX) / 2;
+    const startY = 120;
+    const arr = [];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        if (arr.length >= n) break;
+        const kind = r === 0 ? 2 : r < 2 ? 1 : 0; // 2: boss-ish, 1: mid, 0: grunt
+        arr.push({
+          x: startX + c * gapX,
+          y: startY + r * gapY,
+          vx: 60 * (Math.random() < 0.5 ? 1 : -1),
+          vy: 0,
+          alive: true,
+          kind,
+          inDive: false,
+          cool: rand(0, 2),
+        });
+      }
+    }
+    enemiesRef.current = arr;
+  };
+
+  // Drawing helpers
+  const drawPlayer = (ctx, p) => {
+    ctx.save();
+    ctx.translate(p.x + p.w / 2, p.y + p.h / 2);
+    // body
+    ctx.fillStyle = "white";
+    ctx.beginPath();
+    ctx.moveTo(0, -18);
+    ctx.lineTo(14, 10);
+    ctx.lineTo(0, 6);
+    ctx.lineTo(-14, 10);
+    ctx.closePath();
+    ctx.fill();
+    // cockpit
+    ctx.fillStyle = "#56CCF2";
+    ctx.fillRect(-4, -6, 8, 8);
+    // wings accent
+    ctx.fillStyle = "#EB5757";
+    ctx.fillRect(-18, 6, 8, 6);
+    ctx.fillRect(10, 6, 8, 6);
+    ctx.restore();
+  };
+
+  const drawEnemy = (ctx, e) => {
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    const colors = ["#F2C94C", "#BB6BD9", "#2D9CDB"]; // grunt/mid/boss
+    const col = colors[e.kind] || "#F2C94C";
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.rect(-16, -12, 32, 24);
+    ctx.fill();
+    ctx.fillStyle = "black";
+    ctx.fillRect(-10, -4, 20, 8);
+    // eyes
+    ctx.fillStyle = "white";
+    ctx.fillRect(-8, -2, 4, 4);
+    ctx.fillRect(4, -2, 4, 4);
+    ctx.restore();
+  };
+
+  const drawBullet = (ctx, b) => {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.fillStyle = b.fromEnemy ? "#F2994A" : "#6FCF97";
+    ctx.fillRect(-2, -8, 4, 16);
+    ctx.restore();
+  };
+
+  const drawHud = (ctx) => {
+    ctx.save();
+    ctx.fillStyle = "white";
+    ctx.font = "24px ui-sans-serif, system-ui, -apple-system";
+    ctx.fillText(`SCORE ${score}`, 20, 36);
+    ctx.fillText(`WAVE ${wave}`, GAME_W - 140, 36);
+    // lives icons
+    for (let i = 0; i < lives; i++) {
+      ctx.save();
+      ctx.translate(20 + i * 28, 58);
+      ctx.fillStyle = "white";
+      ctx.beginPath();
+      ctx.moveTo(0, -6);
+      ctx.lineTo(6, 6);
+      ctx.lineTo(0, 3);
+      ctx.lineTo(-6, 6);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+  };
+
+  // Enemy shooting logic
+  const enemyFireMaybe = (dt) => {
+    const enemies = enemiesRef.current;
+    const p = playerRef.current;
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      e.cool -= dt;
+      if (e.cool <= 0 && Math.random() < 0.02) {
+        bulletsRef.current.push({ x: e.x, y: e.y + 14, vy: ENEMY_BULLET_SPEED, fromEnemy: true });
+        e.cool = rand(0.8, 2.0);
+      }
+      // chance to dive
+      if (!e.inDive && Math.random() < 0.0015) {
+        e.inDive = true;
+        const dx = p.x + p.w / 2 - e.x;
+        const dy = p.y - e.y;
+        const len = Math.hypot(dx, dy) || 1;
+        e.vx = (dx / len) * 180;
+        e.vy = (dy / len) * 180;
+      }
+      if (e.inDive) {
+        // gravity-ish influence to curve
+        e.vy += 40 * dt;
+      }
+    }
+  };
+
+  // Build next wave
+  const nextWave = () => {
+    const n = WAVE_BASE_ENEMIES + (wave - 1) * 6;
+    buildWave(Math.min(n, 48));
+  };
+
+  // Game loop
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+
+    let raf = 0;
+    const loop = (t) => {
+      if (!running || paused) {
+        raf = requestAnimationFrame(loop);
+        lastTimeRef.current = t;
+        return;
+      }
+      const last = lastTimeRef.current || t;
+      const dt = Math.min(0.033, (t - last) / 1000); // cap delta
+      lastTimeRef.current = t;
+
+      // UPDATE
+      const p = playerRef.current;
+      const K = keys.current;
+
+      // movement
+      let dir = 0;
+      if (K["ArrowLeft"]) dir -= 1;
+      if (K["ArrowRight"]) dir += 1;
+      p.x += dir * PLAYER_SPEED * dt;
+      p.x = clamp(p.x, 12, GAME_W - p.w - 12);
+
+      // shooting
+      p.cooldown -= dt * 1000;
+      if (K["Space"] && p.cooldown <= 0) {
+        bulletsRef.current.push({ x: p.x + p.w / 2, y: p.y, vy: -BULLET_SPEED });
+        p.cooldown = FIRE_COOLDOWN;
+      }
+
+      // bullets update
+      bulletsRef.current = bulletsRef.current
+        .map((b) => ({ ...b, y: b.y + b.vy * dt }))
+        .filter((b) => b.y > -30 && b.y < GAME_H + 30);
+
+      // enemies update
+      const enemies = enemiesRef.current;
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        e.x += e.vx * dt;
+        e.y += e.vy * dt;
+        if (!e.inDive) {
+          if (e.x < 60 || e.x > GAME_W - 60) e.vx *= -1; // bounce within area
+          // subtle wave motion
+          e.y += Math.sin(t / 300 + e.x * 0.01) * 10 * dt;
+        } else {
+          // wrap back up after dive
+          if (e.y > GAME_H - 200) {
+            e.inDive = false;
+            e.vx = 60 * (Math.random() < 0.5 ? 1 : -1);
+            e.vy = 0;
+            e.y = clamp(e.y, 120, GAME_H - 300);
+          }
+        }
+      }
+
+      // enemy fire
+      enemyFireMaybe(dt);
+
+      // collisions: player bullets vs enemies
+      const pb = bulletsRef.current.filter((b) => !b.fromEnemy);
+      const eb = bulletsRef.current.filter((b) => b.fromEnemy);
+
+      for (const b of pb) {
+        for (const e of enemies) {
+          if (!e.alive) continue;
+          if (rectsOverlap({ x: b.x - 2, y: b.y - 8, w: 4, h: 16 }, { x: e.x - 16, y: e.y - 12, w: 32, h: 24 })) {
+            e.alive = false;
+            b.y = -9999; // remove
+            const add = e.kind === 2 ? 150 : e.kind === 1 ? 80 : 40;
+            setScore((s) => s + add);
+            break;
+          }
+        }
+      }
+      bulletsRef.current = [...pb, ...eb].filter((b) => b.y > -30 && b.y < GAME_H + 30);
+
+      // enemy bullets / body vs player
+      const playerRect = { x: p.x, y: p.y, w: p.w, h: p.h };
+      let hit = false;
+      for (const b of eb) {
+        if (rectsOverlap({ x: b.x - 2, y: b.y - 8, w: 4, h: 16 }, playerRect)) {
+          hit = true;
+          b.y = 9999;
+        }
+      }
+      for (const e of enemies) {
+        if (e.alive && rectsOverlap({ x: e.x - 16, y: e.y - 12, w: 32, h: 24 }, playerRect)) {
+          hit = true;
+          e.alive = false;
+        }
+      }
+      if (hit) {
+        setLives((L) => {
+          const next = L - 1;
+          if (next <= 0) {
+            gameOverRef.current = true;
+            setRunning(false);
+          } else {
+            // brief invulnerability & reset position
+            p.x = GAME_W / 2 - 20;
+            p.y = GAME_H - 120;
+            p.cooldown = 400;
+          }
+          return next;
+        });
+      }
+
+      // wave cleared?
+      if (enemies.every((e) => !e.alive)) {
+        setWave((w) => w + 1);
+        setHint("적 증원! 난이도 상승");
+        // ramp difficulty
+        enemiesRef.current = [];
+        bulletsRef.current = bulletsRef.current.filter((b) => !b.fromEnemy);
+        setTimeout(() => {
+          buildWave(Math.min(WAVE_BASE_ENEMIES + (wave) * 6, 48));
+        }, 300);
+      }
+
+      // RENDER
+      ctx.clearRect(0, 0, GAME_W, GAME_H);
+
+      // starfield background
+      ctx.fillStyle = "black";
+      ctx.fillRect(0, 0, GAME_W, GAME_H);
+      ctx.fillStyle = "white";
+      for (let i = 0; i < 80; i++) {
+        const y = (t * 0.05 + (i * 120)) % GAME_H;
+        const x = (i * 97) % GAME_W;
+        ctx.fillRect(x, y, 2, 2);
+      }
+
+      // draw entities
+      for (const e of enemies) if (e.alive) drawEnemy(ctx, e);
+      drawPlayer(ctx, p);
+      for (const b of bulletsRef.current) drawBullet(ctx, b);
+
+      drawHud(ctx);
+
+      if (!running && !gameOverRef.current) {
+        // attract overlay handled by JSX, but faint hint here too
+        ctx.save();
+        ctx.fillStyle = "rgba(255,255,255,0.06)";
+        ctx.textAlign = "center";
+        ctx.font = "48px ui-sans-serif";
+        ctx.fillText("PRESS START", GAME_W / 2, GAME_H / 2 + 140);
+        ctx.restore();
+      }
+
+      raf = requestAnimationFrame(loop);
+    };
+
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [running, paused, wave]);
+
+  // Start / Restart
+  const startGame = () => {
+    setScore(0);
+    setLives(MAX_LIVES);
+    setWave(1);
+    playerRef.current = { x: GAME_W / 2 - 20, y: GAME_H - 120, w: 40, h: 30, cooldown: 200 };
+    bulletsRef.current = [];
+    gameOverRef.current = false;
+    buildWave(WAVE_BASE_ENEMIES);
+    setRunning(true);
+    setPaused(false);
+    setHint("행운을! (P: 일시정지)");
+  };
+  const togglePause = () => setPaused((p) => !p);
+  const restart = () => startGame();
+
+  // Keyboard UI actions
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.code === "KeyP") { e.preventDefault(); togglePause(); }
+      if (e.code === "KeyR") { e.preventDefault(); restart(); }
+    };
+    window.addEventListener("keydown", handler, { passive: false });
+    return () => window.removeEventListener("keydown", handler, { passive: false });
+  }, []);
+
+  // Touch controls state
+  const touchState = useRef({ left:false, right:false, fire:false });
+  useEffect(() => {
+    const id = setInterval(() => {
+      // apply touch controls to key-hold map
+      const K = keys.current;
+      K["ArrowLeft"] = touchState.current.left;
+      K["ArrowRight"] = touchState.current.right;
+      if (touchState.current.fire) {
+        // simulate space tap burst
+        const p = playerRef.current;
+        if (p.cooldown <= 0) {
+          bulletsRef.current.push({ x: p.x + p.w / 2, y: p.y, vy: -BULLET_SPEED });
+          p.cooldown = FIRE_COOLDOWN;
+        }
+      }
+    }, 50);
+    return () => clearInterval(id);
+  }, [keys]);
+
+  return (
+    <div className="w-full h-full min-h-[600px] grid place-items-center p-2 bg-neutral-950" ref={wrapRef}>
+      <div className="relative" style={{ width: GAME_W * scale, height: GAME_H * scale }}>
+        <canvas
+          ref={canvasRef}
+          width={GAME_W}
+          height={GAME_H}
+          className="rounded-2xl shadow-2xl ring-1 ring-white/10"
+          style={{ width: GAME_W * scale, height: GAME_H * scale }}
+        />
+
+        {/* Top UI overlay */}
+        <div className="pointer-events-none absolute inset-0 flex flex-col">
+          <div className="flex items-center justify-between p-3 gap-2">
+            <div className="text-white/80 text-sm sm:text-base select-none">Galaga-like · Wave {wave}</div>
+            <div className="flex gap-2 pointer-events-auto">
+              <button
+                onClick={togglePause}
+                className="px-3 py-1 rounded-xl bg-white/10 text-white text-sm hover:bg-white/20 transition"
+              >{paused ? "재개 (P)" : "일시정지 (P)"}</button>
+              <button
+                onClick={restart}
+                className="px-3 py-1 rounded-xl bg-white/10 text-white text-sm hover:bg-white/20 transition"
+              >다시시작 (R)</button>
+            </div>
+          </div>
+          <div className="mt-auto p-3 text-center text-white/70 text-sm select-none">{hint}</div>
+        </div>
+
+        {/* Start & GameOver Modals */}
+        <AnimatePresence>
+          {!running && !gameOverRef.current && (
+            <motion.div
+              key="start"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 grid place-items-center"
+            >
+              <div className="pointer-events-auto bg-neutral-900/90 backdrop-blur rounded-2xl shadow-xl p-6 w-[86%] max-w-md border border-white/10 text-white text-center">
+                <h1 className="text-2xl font-semibold mb-2 tracking-wide">갤러그 시작</h1>
+                <p className="text-white/80 mb-4">← → 이동 · Space 발사 · P 일시정지 · R 재시작</p>
+                <button onClick={startGame} className="px-5 py-2 rounded-xl bg-white text-black font-semibold hover:opacity-90 transition">START</button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        <AnimatePresence>
+          {!running && gameOverRef.current && (
+            <motion.div
+              key="over"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 grid place-items-center"
+            >
+              <div className="pointer-events-auto bg-neutral-900/90 backdrop-blur rounded-2xl shadow-xl p-6 w-[86%] max-w-md border border-white/10 text-white text-center">
+                <h1 className="text-2xl font-semibold mb-1 tracking-wide">GAME OVER</h1>
+                <p className="text-white/80 mb-4">점수 {score} · Wave {wave}</p>
+                <div className="flex gap-2 justify-center">
+                  <button onClick={startGame} className="px-5 py-2 rounded-xl bg-white text-black font-semibold hover:opacity-90 transition">RESTART</button>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Touch controls */}
+        {showTouch && (
+          <div className="absolute bottom-2 left-0 right-0 flex items-center justify-between gap-2 px-3 select-none">
+            <TouchBtn label="◀" onPress={(v)=> (touchState.current.left=v)} />
+            <TouchBtn label="▶" onPress={(v)=> (touchState.current.right=v)} />
+            <TouchBtn label="FIRE" wide onPress={(v)=> (touchState.current.fire=v)} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TouchBtn({ label, onPress, wide }) {
+  useEffect(() => {
+    return () => onPress(false);
+  }, [onPress]);
+  return (
+    <button
+      className={
+        "pointer-events-auto rounded-2xl bg-white/10 text-white text-lg font-semibold py-3 " +
+        (wide ? "px-10" : "px-6") +
+        " active:bg-white/20 backdrop-blur border border-white/10"
+      }
+      onTouchStart={(e) => { e.preventDefault(); onPress(true); }}
+      onTouchEnd={(e) => { e.preventDefault(); onPress(false); }}
+      onMouseDown={() => onPress(true)}
+      onMouseUp={() => onPress(false)}
+      onMouseLeave={() => onPress(false)}
+    >
+      {label}
+    </button>
+  );
+}
